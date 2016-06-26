@@ -2531,8 +2531,6 @@ function setindex!{TvA,TiI<:Integer,TiJ<:Integer}(A::SparseMatrixCSC{TvA}, x::Nu
         _spsetnz_setindex!(A, convert(TvA, x), I, J)
     end
 end
-setindex!{Tv,T<:Integer}(A::SparseMatrixCSC{Tv}, x::Number, I::AbstractVector{T}, J::AbstractVector{T}) =
-    (0 == x) ? spdelete!(A, I, J) : spset!(A, convert(Tv,x), I, J)
 
 """
 Helper method for immediately preceding setindex! method. For all (i,j) such that i in I and

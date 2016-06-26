@@ -910,7 +910,7 @@ dense counterparts. The following functions are specific to sparse arrays.
 
    For additional documentation and an expert driver, see ``Base.SparseArrays.sparse!``\ .
 
-.. function:: sparsevec(I, V, [m, combine])
+.. function:: sparsevec(I, V, combine)
 
    .. Docstring generated from Julia source
 
