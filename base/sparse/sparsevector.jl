@@ -14,9 +14,12 @@ immutable SparseVector{Tv,Ti<:Integer} <: AbstractSparseVector{Tv,Ti}
     nzval::Vector{Tv}   # the values of nonzeros
 
     function SparseVector(n::Integer, nzind::Vector{Ti}, nzval::Vector{Tv})
-        n >= 0 || throw(ArgumentError("The number of elements must be non-negative."))
-        length(nzind) == length(nzval) ||
-            throw(ArgumentError("index and value vectors must be the same length"))
+        if n < 0
+            throw(ArgumentError("the number of elements must be non-negative."))
+        end
+        if length(nzind) != length(nzval)
+            throw(DimensionMismatch("index vector has length $(length(nzind)), and value vector has length $(length(nzval)), but these must be the same length"))
+        end
         new(convert(Int, n), nzind, nzval)
     end
 end
@@ -89,7 +92,7 @@ function _sparsevector!{Tv,Ti<:Integer}(I::Vector{Ti}, V::Vector{Tv}, len::Integ
 end
 
 """
-    sparsevec(I, V, [m, combine])
+    sparsevec(I, V, combine)
 
 Create a sparse vector `S` of length `m` such that `S[I[k]] = V[k]`.
 Duplicates are combined using the `combine` function, which defaults to
@@ -97,11 +100,14 @@ Duplicates are combined using the `combine` function, which defaults to
 in which case `combine` defaults to `|`.
 """
 function sparsevec{Tv,Ti<:Integer}(I::AbstractVector{Ti}, V::AbstractVector{Tv}, combine::Function)
-    length(I) == length(V) ||
-        throw(ArgumentError("index and value vectors must be the same length"))
+    if length(I) != length(V)
+        throw(DimensionMismatch("index vector has length $(length(I)), and value vector has length $(length(V)), but these must be the same length"))
+    end
     len = 0
     for i in I
-        i >= 1 || error("Index must be positive.")
+        if i < 1
+            throw(ArgumentError("index must be positive"))
+        end
         if i > len
             len = i
         end
@@ -110,11 +116,14 @@ function sparsevec{Tv,Ti<:Integer}(I::AbstractVector{Ti}, V::AbstractVector{Tv},
 end
 
 function sparsevec{Tv,Ti<:Integer}(I::AbstractVector{Ti}, V::AbstractVector{Tv}, len::Integer, combine::Function)
-    length(I) == length(V) ||
-        throw(ArgumentError("index and value vectors must be the same length"))
+    if length(I) != length(V)
+        throw(DimensionMismatch("index vector has length $(length(I)), and value vector has length $(length(V)), but these must be the same length"))
+    end
     maxi = convert(Ti, len)
     for i in I
-        1 <= i <= maxi || throw(ArgumentError("An index is out of bound."))
+        if !(1 <= i <= maxi)
+            throw(ArgumentError("all indices of I must be between 1 and len, $len"))
+        end
     end
     _sparsevector!(collect(Ti, I), collect(Tv, V), len, combine)
 end
@@ -155,7 +164,9 @@ function sparsevec{Tv,Ti<:Integer}(dict::Associative{Ti,Tv})
     cnt = 0
     len = zero(Ti)
     for (k, v) in dict
-        k >= 1 || throw(ArgumentError("index must be positive."))
+        if k < 1
+            throw(ArgumentError("index must be positive."))
+        end
         if k > len
             len = k
         end
@@ -176,7 +187,9 @@ function sparsevec{Tv,Ti<:Integer}(dict::Associative{Ti,Tv}, len::Integer)
     cnt = 0
     maxk = convert(Ti, len)
     for (k, v) in dict
-        1 <= k <= maxk || throw(ArgumentError("an index (key) is out of bound."))
+        if !(1 <= k <= maxk)
+            throw(ArgumentError("all indices must be between 1 and len, $len, but one is out of bounds"))
+        end
         cnt += 1
         @inbounds nzind[cnt] = k
         @inbounds nzval[cnt] = v
@@ -237,7 +250,9 @@ end
 
 # convert SparseMatrixCSC to SparseVector
 function convert{Tv,Ti<:Integer}(::Type{SparseVector{Tv,Ti}}, s::SparseMatrixCSC{Tv,Ti})
-    size(s, 2) == 1 || throw(ArgumentError("The input argument must have a single-column."))
+    if size(s, 2) != 1
+        throw(ArgumentError("the input argument must be a single column."))
+    end
     SparseVector(s.m, s.rowval, s.nzval)
 end
 
@@ -307,7 +322,9 @@ convert{Tv,TvS,TiS}(::Type{SparseVector{Tv}}, s::SparseVector{TvS,TiS}) =
 ### copying
 function prep_sparsevec_copy_dest!(A::SparseVector, lB, nnzB)
     lA = length(A)
-    lA >= lB || throw(BoundsError())
+    if lA < lB
+        throw(ArgumentError("length of A, $lA, does not match length of B, $lB"))
+    end
     # If the two vectors have the same length then all the elements in A will be overwritten.
     if length(A) == lB
         resize!(A.nzval, nnzB)
@@ -341,8 +358,12 @@ function copy!(A::SparseVector, B::SparseMatrixCSC)
     prep_sparsevec_copy_dest!(A, length(B), nnz(B))
 
     ptr = 1
-    @assert length(A.nzind) >= length(B.rowval)
-    maximum(B.colptr)-1 <= length(B.rowval) || throw(BoundsError())
+    if length(A.nzind) < length(B.rowval)
+        throw(DimensionMismatch("A has $(length(A.nzind)) non-zero indices, B has $(length(B.rowval)) row values"))
+    end
+    if maximum(B.colptr)-1 > length(B.rowval)
+        throw(BoundsError())
+    end
     @inbounds for col=1:length(B.colptr)-1
         offsetA = (col - 1) * B.m
         while ptr <= B.colptr[col+1]-1
@@ -704,8 +725,9 @@ copy(x::AbstractSparseVector) =
     SparseVector(length(x), copy(nonzeroinds(x)), copy(nonzeros(x)))
 
 function reinterpret{T,Tv}(::Type{T}, x::AbstractSparseVector{Tv})
-    sizeof(T) == sizeof(Tv) ||
+    if sizeof(T) != sizeof(Tv)
         throw(ArgumentError("reinterpret of sparse vectors only supports element types of the same size."))
+    end
     SparseVector(length(x), copy(nonzeroinds(x)), reinterpret(T, nonzeros(x)))
 end
 
@@ -726,8 +748,9 @@ function hcat{Tv,Ti}(X::AbstractSparseVector{Tv,Ti}...)
     m = length(X[1])
     tnnz = nnz(X[1])
     for j = 2:n
-        length(X[j]) == m ||
-            throw(DimensionMismatch("Inconsistent column lengths."))
+        if length(X[j]) != m
+            throw(DimensionMismatch("columns should have length $m, but column $j has length $(length(X[j]))"))
+        end
         tnnz += nnz(X[j])
     end
 
@@ -884,10 +907,14 @@ function _binarymap{Tx,Ty}(f::Function,
                            y::AbstractSparseVector{Ty},
                            mode::Int)
 
-    0 <= mode <= 2 || throw(ArgumentError("Incorrect mode $mode."))
+    if !(0 <= mode <= 2)
+        throw(ArgumentError("incorrect mode $mode, must be between 0 and 2."))
+    end
     R = typeof(f(zero(Tx), zero(Ty)))
     n = length(x)
-    length(y) == n || throw(DimensionMismatch())
+    if length(y) != n
+        throw(DimensionMismatch("y has length $(length(y)) but should have the same length as x, $n"))
+    end
 
     xnzind = nonzeroinds(x)
     xnzval = nonzeros(x)
@@ -1025,11 +1052,14 @@ function _binarymap{Tx,Ty}(f::Function,
                            x::AbstractVector{Tx},
                            y::AbstractSparseVector{Ty},
                            mode::Int)
-
-    0 <= mode <= 2 || throw(ArgumentError("Incorrect mode $mode."))
+    if !(0 <= mode <= 2)
+        throw(ArgumentError("incorrect mode $mode, must be between 0 and 2."))
+    end
     R = typeof(f(zero(Tx), zero(Ty)))
     n = length(x)
-    length(y) == n || throw(DimensionMismatch())
+    if length(y) != n
+        throw(DimensionMismatch("y has length $(length(y)) but should have the same length as x, $n"))
+    end
 
     ynzind = nonzeroinds(y)
     ynzval = nonzeros(y)
@@ -1069,10 +1099,14 @@ function _binarymap{Tx,Ty}(f::Function,
                            y::AbstractVector{Ty},
                            mode::Int)
 
-    0 <= mode <= 2 || throw(ArgumentError("Incorrect mode $mode."))
+    if !(0 <= mode <= 2)
+        throw(ArgumentError("incorrect mode $mode, must be between 0 and 2."))
+    end
     R = typeof(f(zero(Tx), zero(Ty)))
     n = length(x)
-    length(y) == n || throw(DimensionMismatch())
+    if length(y) != n
+        throw(DimensionMismatch("y has length $(length(y)) but should have the same length as x, $n"))
+    end
 
     xnzind = nonzeroinds(x)
     xnzval = nonzeros(x)
@@ -1157,22 +1191,23 @@ sum(x::AbstractSparseVector) = sum(nonzeros(x))
 sumabs(x::AbstractSparseVector) = sumabs(nonzeros(x))
 sumabs2(x::AbstractSparseVector) = sumabs2(nonzeros(x))
 
-function maximum{T<:Real}(x::AbstractSparseVector{T})
-    n = length(x)
-    n > 0 || throw(ArgumentError("maximum over empty array is not allowed."))
-    m = nnz(x)
-    (m == 0 ? zero(T) :
-     m == n ? maximum(nonzeros(x)) :
-     max(zero(T), maximum(nonzeros(x))))::T
-end
-
-function minimum{T<:Real}(x::AbstractSparseVector{T})
-    n = length(x)
-    n > 0 || throw(ArgumentError("minimum over empty array is not allowed."))
-    m = nnz(x)
-    (m == 0 ? zero(T) :
-     m == n ? minimum(nonzeros(x)) :
-     min(zero(T), minimum(nonzeros(x))))::T
+for (f,g) in ((:maximum, :max), (:minimum,:min))
+    @eval begin
+        function $(f){T<:Real}(x::AbstractSparseVector{T})
+            n = length(x)
+            if n <= 0
+                throw(ArgumentError("$($(f)) over empty array is not allowed."))
+            end
+            m = nnz(x)
+            if m == 0
+                return zero(T)
+            elseif m == n
+                return $(f)(nonzeros(x))::T
+            else
+                return $(g)(zero(T), $(f)(nonzeros(x)))::T
+            end
+        end
+    end
 end
 
 maxabs{T<:Number}(x::AbstractSparseVector{T}) = maxabs(nonzeros(x))
@@ -1202,7 +1237,9 @@ end
 # axpy
 
 function LinAlg.axpy!(a::Number, x::AbstractSparseVector, y::StridedVector)
-    length(x) == length(y) || throw(DimensionMismatch())
+    if length(x) != length(y)
+        throw(DimensionMismatch("length of x, $(length(x)), must match length of y, $(length(y))"))
+    end
     nzind = nonzeroinds(x)
     nzval = nonzeros(x)
     m = length(nzind)
@@ -1247,7 +1284,9 @@ scale!(a::Complex, x::AbstractSparseVector) = scale!(nonzeros(x), a)
 
 function dot{Tx<:Number,Ty<:Number}(x::StridedVector{Tx}, y::AbstractSparseVector{Ty})
     n = length(x)
-    length(y) == n || throw(DimensionMismatch())
+    if n != length(y)
+        throw(DimensionMismatch("length of x, $n, must match length of y, $(length(y))"))
+    end
     nzind = nonzeroinds(y)
     nzval = nonzeros(y)
     s = zero(Tx) * zero(Ty)
@@ -1259,7 +1298,9 @@ end
 
 function dot{Tx<:Number,Ty<:Number}(x::AbstractSparseVector{Tx}, y::AbstractVector{Ty})
     n = length(y)
-    length(x) == n || throw(DimensionMismatch())
+    if n != length(x)
+        throw(DimensionMismatch("length of x, $(length(x)), must match length of y, $(length(y))"))
+    end
     nzind = nonzeroinds(x)
     nzval = nonzeros(x)
     s = zero(Tx) * zero(Ty)
@@ -1293,7 +1334,9 @@ end
 function dot{Tx<:Number,Ty<:Number}(x::AbstractSparseVector{Tx}, y::AbstractSparseVector{Ty})
     is(x, y) && return sumabs2(x)
     n = length(x)
-    length(y) == n || throw(DimensionMismatch())
+    if n != length(y)
+        throw(DimensionMismatch("length of x, $(length(x)), must match length of y, $(length(y))"))
+    end
 
     xnzind = nonzeroinds(x)
     ynzind = nonzeroinds(y)
@@ -1312,7 +1355,9 @@ end
 
 function *{Ta,Tx}(A::StridedMatrix{Ta}, x::AbstractSparseVector{Tx})
     m, n = size(A)
-    length(x) == n || throw(DimensionMismatch())
+    if n != length(x)
+        throw(DimensionMismatch("length of x, $(length(x)), must match second dimension of A, $n"))
+    end
     Ty = promote_type(Ta, Tx)
     y = Array{Ty}(m)
     A_mul_B!(y, A, x)
@@ -1323,7 +1368,12 @@ A_mul_B!{Tx,Ty}(y::StridedVector{Ty}, A::StridedMatrix, x::AbstractSparseVector{
 
 function A_mul_B!(α::Number, A::StridedMatrix, x::AbstractSparseVector, β::Number, y::StridedVector)
     m, n = size(A)
-    length(x) == n && length(y) == m || throw(DimensionMismatch())
+    if length(x) != n
+        throw(DimensionMismatch("length of x, $(length(x)), must match second dimension of A, $n"))
+    end
+    if length(y) != m
+        throw(DimensionMismatch("length of y, $(length(y)), must match first dimension of A, $m"))
+    end
     m == 0 && return y
     if β != one(β)
         β == zero(β) ? fill!(y, zero(eltype(y))) : scale!(y, β)
@@ -1349,7 +1399,9 @@ end
 
 function At_mul_B{Ta,Tx}(A::StridedMatrix{Ta}, x::AbstractSparseVector{Tx})
     m, n = size(A)
-    length(x) == m || throw(DimensionMismatch())
+    if length(x) != m
+        throw(DimensionMismatch("length of x, $(length(x)), must match first dimension of A, $m"))
+    end
     Ty = promote_type(Ta, Tx)
     y = Array{Ty}(n)
     At_mul_B!(y, A, x)
@@ -1360,7 +1412,13 @@ At_mul_B!{Tx,Ty}(y::StridedVector{Ty}, A::StridedMatrix, x::AbstractSparseVector
 
 function At_mul_B!(α::Number, A::StridedMatrix, x::AbstractSparseVector, β::Number, y::StridedVector)
     m, n = size(A)
-    length(x) == m && length(y) == n || throw(DimensionMismatch())
+    if length(x) != m
+        throw(DimensionMismatch("length of x, $(length(x)), must match first dimension of A, $m"))
+    end
+    if length(y) != n
+        throw(DimensionMismatch("length of y, $(length(y)), must match second dimension of A, $n"))
+    end
+
     n == 0 && return y
     if β != one(β)
         β == zero(β) ? fill!(y, zero(eltype(y))) : scale!(y, β)
@@ -1394,19 +1452,19 @@ function densemv(A::SparseMatrixCSC, x::AbstractSparseVector; trans::Char='N')
     elseif trans == 'T' || trans == 't' || trans == 'C' || trans == 'c'
         xlen = m; ylen = n
     else
-        throw(ArgumentError("Invalid trans character $trans"))
+        throw(ArgumentError("invalid trans character $trans - must be one of `T`, `N`, `C`, `t`, `n`, or `c`."))
     end
-    xlen == length(x) || throw(DimensionMismatch())
+    if xlen != length(x)
+        throw(DimensionMismatch("length of x, $(length(x)), must equal the first dimension of A, $m"))
+    end
     T = promote_type(eltype(A), eltype(x))
     y = Array{T}(ylen)
-    if trans == 'N' || trans == 'N'
+    if trans == 'N' || trans == 'n'
         A_mul_B!(y, A, x)
     elseif trans == 'T' || trans == 't'
         At_mul_B!(y, A, x)
     elseif trans == 'C' || trans == 'c'
         Ac_mul_B!(y, A, x)
-    else
-        throw(ArgumentError("Invalid trans character $trans"))
     end
     y
 end
@@ -1418,7 +1476,12 @@ A_mul_B!{Tx,Ty}(y::StridedVector{Ty}, A::SparseMatrixCSC, x::AbstractSparseVecto
 
 function A_mul_B!(α::Number, A::SparseMatrixCSC, x::AbstractSparseVector, β::Number, y::StridedVector)
     m, n = size(A)
-    length(x) == n && length(y) == m || throw(DimensionMismatch())
+    if length(x) != n
+        throw(DimensionMismatch("length of x, $(length(x)), must equal the second dimension of A, $n"))
+    end
+    if length(y) != m
+        throw(DimensionMismatch("length of y, $(length(y)), must equal the first dimension of A, $m"))
+    end
     m == 0 && return y
     if β != one(β)
         β == zero(β) ? fill!(y, zero(eltype(y))) : scale!(y, β)
@@ -1462,7 +1525,12 @@ function _At_or_Ac_mul_B!{Tx,Ty}(tfun::Function,
                                  α::Number, A::SparseMatrixCSC, x::AbstractSparseVector{Tx},
                                  β::Number, y::StridedVector{Ty})
     m, n = size(A)
-    length(x) == m && length(y) == n || throw(DimensionMismatch())
+    if length(x) != m
+        throw(DimensionMismatch("length of x, $(length(x)), must equal the first dimension of A, $m"))
+    end
+    if length(y) != n
+        throw(DimensionMismatch("length of y, $(length(y)), must equal the second dimension of A, $n"))
+    end
     n == 0 && return y
     if β != one(β)
         β == zero(β) ? fill!(y, zero(eltype(y))) : scale!(y, β)
@@ -1502,7 +1570,9 @@ Ac_mul_B(A::SparseMatrixCSC, x::AbstractSparseVector) =
 
 function _At_or_Ac_mul_B{TvA,TiA,TvX,TiX}(tfun::Function, A::SparseMatrixCSC{TvA,TiA}, x::AbstractSparseVector{TvX,TiX})
     m, n = size(A)
-    length(x) == m || throw(DimensionMismatch())
+    if length(x) != m
+        throw(DimensionMismatch("length of x, $(length(x)), must equal first dimension of A, $m"))
+    end
     Tv = promote_type(TvA, TvX)
     Ti = promote_type(TiA, TiX)
 

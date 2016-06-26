@@ -134,8 +134,11 @@ end
 function sparse_compute_reshaped_colptr_and_rowval{Ti}(colptrS::Vector{Ti}, rowvalS::Vector{Ti}, mS::Int, nS::Int, colptrA::Vector{Ti}, rowvalA::Vector{Ti}, mA::Int, nA::Int)
     lrowvalA = length(rowvalA)
     maxrowvalA = (lrowvalA > 0) ? maximum(rowvalA) : zero(Ti)
-    ((length(colptrA) == (nA+1)) && (maximum(colptrA) <= (lrowvalA+1)) && (maxrowvalA <= mA)) || throw(BoundsError())
-
+    if length(colptrA) != (nA+1) || maximum(colptrA) > lrowvalA+1
+        Base.throw_boundsError(A,colptrA)
+    elseif maxrowvalA > mA
+        Base.throw_boundsError(A,maxrowvalA)
+    end
     colptrS[1] = 1
     colA = 1
     colS = 1
@@ -2528,6 +2531,9 @@ function setindex!{TvA,TiI<:Integer,TiJ<:Integer}(A::SparseMatrixCSC{TvA}, x::Nu
         _spsetnz_setindex!(A, convert(TvA, x), I, J)
     end
 end
+setindex!{Tv,T<:Integer}(A::SparseMatrixCSC{Tv}, x::Number, I::AbstractVector{T}, J::AbstractVector{T}) =
+    (0 == x) ? spdelete!(A, I, J) : spset!(A, convert(Tv,x), I, J)
+
 """
 Helper method for immediately preceding setindex! method. For all (i,j) such that i in I and
 j in J, assigns zero to A[i,j] if A[i,j] is a presently-stored entry, and otherwise does nothing.
@@ -2708,7 +2714,7 @@ function setindex!{Tv,Ti,T<:Integer}(A::SparseMatrixCSC{Tv,Ti}, B::SparseMatrixC
     mB, nB = size(B)
 
     if (!isempty(I) && (I[1] < 1 || I[end] > m)) || (!isempty(J) && (J[1] < 1 || J[end] > n))
-        throw(BoundsError(A, (I, J)))
+        Base.throw_boundserror(A, (I, J))
     end
 
     if isempty(I) || isempty(J)
