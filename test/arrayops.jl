@@ -1701,5 +1701,3 @@ A = fill(Foo(), 10, 10)
 for op in (:.+, :.*, :.÷, :.%, :.<<, :.>>, :.-, :./, :.\, :.//, :.^)
     @eval @test typeof($(op)(A,A)) == Matrix{Foo}
 end
-
-end
