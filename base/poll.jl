@@ -12,7 +12,7 @@ export
 
 import Base: @handle_as, wait, close, uvfinalize, eventloop, notify_error, stream_wait,
     _sizeof_uv_poll, _sizeof_uv_fs_poll, _sizeof_uv_fs_event, _uv_hook_close,
-    associate_julia_struct, disassociate_julia_struct
+    associate_julia_struct, disassociate_julia_struct, isreadable, iswritable
 if is_windows()
     import Base.WindowsRawSocket
 end
@@ -34,20 +34,23 @@ fetimeout() = FileEvent(false, false, true)
 immutable FDEvent
     readable::Bool
     writable::Bool
+    disconnect::Bool
     timedout::Bool
 end
 # libuv file descriptor event flags
 const UV_READABLE = 1
 const UV_WRITABLE = 2
-const FD_TIMEDOUT = 4
+const UV_DISCONNECT = 2
+const FD_TIMEDOUT = 8
 
 isreadable(f::FDEvent) = f.readable
 iswritable(f::FDEvent) = f.writable
-FDEvent() = FDEvent(false, false, false)
+FDEvent() = FDEvent(false, false, false, false)
 FDEvent(flags::Integer) = FDEvent((flags & UV_READABLE) != 0,
                                   (flags & UV_WRITABLE) != 0,
+                                  (flags & UV_DISCONNECT) != 0,
                                   (flags & FD_TIMEDOUT) != 0)
-fdtimeout() = FDEvent(false, false, true)
+fdtimeout() = FDEvent(false, false, false, true)
 
 type FileMonitor
     handle::Ptr{Void}
@@ -61,10 +64,10 @@ type FileMonitor
         err = ccall(:uv_fs_event_init, Cint, (Ptr{Void}, Ptr{Void}), eventloop(), handle)
         if err != 0
             Libc.free(handle)
-            throw(UVError("PollingFileWatcher", err))
+            throw(UVError("FileMonitor", err))
         end
         finalizer(this, uvfinalize)
-        this
+        return this
     end
 end
 
@@ -74,9 +77,10 @@ type PollingFileWatcher
     interval::UInt32
     notify::Condition
     active::Bool
+    busy_polling::Int32
     function PollingFileWatcher(file::AbstractString, interval::Float64=5.007) # same default as nodejs
         handle = Libc.malloc(_sizeof_uv_fs_poll)
-        this = new(handle, file, round(UInt32, interval*1000), Condition(), false)
+        this = new(handle, file, round(UInt32, interval*1000), Condition(), false, 0)
         associate_julia_struct(handle, this)
         err = ccall(:uv_fs_poll_init, Int32, (Ptr{Void}, Ptr{Void}), eventloop(), handle)
         if err != 0
@@ -205,7 +209,7 @@ end
 function _uv_hook_close(uv::PollingFileWatcher)
     uv.handle = C_NULL
     uv.active = false
-    notify(uv.notify, (StatStruct(), StatStruct()))
+    notify(uv.notify, (StatStruct(), EOFError()))
     nothing
 end
 
@@ -245,11 +249,10 @@ end
 
 function uv_fspollcb(handle::Ptr{Void}, status::Int32, prev::Ptr, curr::Ptr)
     t = @handle_as handle PollingFileWatcher
-    if status != 0
-        notify_error(t.notify, UVError("PollingFileWatcher", status))
-    else
+    if status == 0 || status != t.busy_polling
+        t.busy_polling = status
         prev_stat = StatStruct(convert(Ptr{UInt8}, prev))
-        curr_stat = StatStruct(convert(Ptr{UInt8}, curr))
+        curr_stat = (status == 0) ? StatStruct(convert(Ptr{UInt8}, curr)) : UVError("PollingFileWatcher", status)
         notify(t.notify, (prev_stat, curr_stat))
     end
     nothing
@@ -266,6 +269,7 @@ function start_watching(t::_FDWatcher)
                        uv_jl_pollcb::Ptr{Void}))
         t.active = (read, write)
     end
+    nothing
 end
 
 function stop_watching(t::_FDWatcher)
@@ -278,6 +282,7 @@ function stop_watching(t::_FDWatcher)
             start_watching(t) # make sure the READABLE / WRITEABLE state is updated
         end
     end
+    nothing
 end
 
 function start_watching(t::PollingFileWatcher)
@@ -287,6 +292,7 @@ function start_watching(t::PollingFileWatcher)
                        t.handle, uv_jl_fspollcb::Ptr{Void}, t.file, t.interval))
         t.active = true
     end
+    nothing
 end
 
 function stop_watching(t::PollingFileWatcher)
@@ -295,6 +301,7 @@ function stop_watching(t::PollingFileWatcher)
         uv_error("stop_watching (File)",
                  ccall(:uv_fs_poll_stop, Int32, (Ptr{Void},), t.handle))
     end
+    nothing
 end
 
 function start_watching(t::FileMonitor)
@@ -304,6 +311,7 @@ function start_watching(t::FileMonitor)
                        t.handle, uv_jl_fseventscb::Ptr{Void}, t.file, 0))
         t.active = true
     end
+    nothing
 end
 
 function stop_watching(t::FileMonitor)
@@ -312,10 +320,11 @@ function stop_watching(t::FileMonitor)
         uv_error("stop_watching (FileMonitor)",
                  ccall(:uv_fs_event_stop, Int32, (Ptr{Void},), t.handle))
     end
+    nothing
 end
 
 function wait(fdw::FDWatcher)
-    wait(fdw.watcher, readable = fdw.readable, writable = fdw.writable)
+    return wait(fdw.watcher, readable = fdw.readable, writable = fdw.writable)
 end
 function wait(fdw::_FDWatcher; readable=true, writable=true)
     local events
@@ -328,7 +337,7 @@ function wait(fdw::_FDWatcher; readable=true, writable=true)
         end
     end
     stop_watching(fdw)
-    events
+    return events
 end
 
 function wait(fd::RawFD; readable=false, writable=false)
@@ -392,7 +401,14 @@ function watch_file(s::AbstractString, timeout_s::Real=-1)
         if timeout_s >= 0
             result = fetimeout()
 
-            @schedule (try result = wait(fm); catch e; notify_error(wt, e); end; notify(wt))
+            @schedule begin
+                try
+                    result = wait(fm)
+                catch e
+                    notify_error(wt, e)
+                end
+                notify(wt)
+            end
             @schedule (sleep(timeout_s); notify(wt))
 
             wait(wt)
@@ -412,12 +428,24 @@ function poll_file(s::AbstractString, interval_seconds::Real=5.007, timeout_s::R
         if timeout_s >= 0
             result = :timeout
 
-            @schedule (try result = wait(pfw); catch e; notify_error(wt, e); end; notify(wt))
+            @schedule begin
+                try
+                    statdiff = wait(pfw)
+                    if result[1] == StatStruct() && isa(result[2], UVError)
+                        # file didn't initially exist, continue watching for it to be created (or the error to change)
+                        statdiff = wait(pfw)
+                    end
+                    result = statdiff
+                catch e
+                    notify_error(wt, e)
+                end
+                notify(wt)
+            end
             @schedule (sleep(timeout_s); notify(wt))
 
             wait(wt)
             if result === :timeout
-                return (StatStruct(), StatStruct())
+                return (StatStruct(), EOFError())
             end
             return result
         else
