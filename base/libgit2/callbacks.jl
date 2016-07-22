@@ -142,11 +142,22 @@ function credentials_callback(cred::Ptr{Ptr{Void}}, url_ptr::Cstring,
         end
         creds[:pubkey, credid] = publickey # save credentials
 
+        passphrase_required = true
+        if !isfile(privatekey)
+            warn("Private key not found")
+        else
+            # In encrypted private keys, the second line is "Proc-Type: 4,ENCRYPTED"
+            open(privatekey) do f
+                passphrase_required = (readline(f); readline(f) == "Proc-Type: 4,ENCRYPTED\n")
+            end
+        end
+
         passphrase = if haskey(ENV,"SSH_KEY_PASS")
             ENV["SSH_KEY_PASS"]
         else
             passdef = creds[:pass, credid] # check if credentials were already used
-            if passdef === nothing || isusedcreds
+            passdef === nothing && (passdef = "")
+            if passphrase_required && (isempty(passdef) || isusedcreds)
                 if is_windows()
                     passdef = Base.winprompt(
                         "Your SSH Key requires a password, please enter it now:",
@@ -157,8 +168,9 @@ function credentials_callback(cred::Ptr{Ptr{Void}}, url_ptr::Cstring,
                     passdef = prompt("Passphrase for $privatekey", password=true)
                 end
             end
+            passdef
         end
-        creds[:pass, credid] = passphrase # save credentials
+        creds[:pass, credid] = passphrase
 
         isempty(username) && return Cint(Error.EAUTH)
 
