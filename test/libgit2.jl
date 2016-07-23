@@ -2,6 +2,9 @@
 
 #@testset "libgit2" begin
 
+isdefined(:TestHelpers) || include(joinpath(dirname(@__FILE__), "TestHelpers.jl"))
+using TestHelpers
+
 const LIBGIT2_MIN_VER = v"0.23.0"
 
 #########
@@ -598,6 +601,134 @@ mktempdir() do dir
         @test creds[:pass, "localhost"] == creds_pass
         @test creds[:pubkey, "localhost"] === nothing
         @test creds[:usesshagent, "localhost"] == "Y"
+    #end
+
+    #@testset "SSH" begin
+        sshd_command = ""
+        ssh_repo = joinpath(dir, "Example.SSH")
+        !is_windows() && (sshd_command = strip(readstring(`which sshd`)))
+        if !isempty(sshd_command)
+            mktempdir() do fakehomedir
+                oldhome = ENV["HOME"]
+                ENV["HOME"] = fakehomedir
+                mkdir(joinpath(fakehomedir,".ssh"))
+                # Unsetting the SSH agent serves two purposes. First, we make
+                # sure that we don't accidentally pick up an existing agent,
+                # and second we test that we fall back to using a key file
+                # if the agent isn't present.
+                withenv("HOME"=>fakehomedir,"SSH_AUTH_SOCK"=>nothing) do
+                    # Generate user file, first an unencrypted one
+                    wait(spawn(`ssh-keygen -N "" -C juliatest@localhost -f $fakehomedir/.ssh/id_rsa`))
+
+                    # Generate host keys
+                    wait(spawn(`ssh-keygen -f $fakehomedir/ssh_host_rsa_key -N '' -t rsa`))
+                    wait(spawn(`ssh-keygen -f $fakehomedir/ssh_host_dsa_key -N '' -t dsa`))
+
+                    our_ssh_port = rand(13000:14000) # Chosen arbitrarily
+
+                    key_option = "AuthorizedKeysFile $fakehomedir/.ssh/id_rsa.pub"
+                    p = agentp = nothing
+                    p = spawn(pipeline(pipeline(`$sshd_command -f /dev/null
+                        -h $fakehomedir/ssh_host_rsa_key
+                        -h $fakehomedir/ssh_host_dsa_key -p $our_ssh_port
+                        -o 'Protocol 2'
+                        -o $key_option
+                        -o 'UsePrivilegeSeparation no'
+                        -o 'StrictModes no'`,STDOUT),stderr=STDERR))
+
+                    try
+                        # Give the SSH server 5 seconds to start up
+                        yield(); sleep(5)
+
+                        function try_clone(challenges = [])
+                            cmd = """
+                            repo = nothing
+                            try
+                                reponame = "ssh://$(ENV["USER"])@localhost:$our_ssh_port$cache_repo"
+                                repo = LibGit2.clone(reponame, "$ssh_repo")
+                            finally
+                                finalize(repo)
+                            end
+                            """
+                            # We try to be helpful by desparately looking for
+                            # a way to prompt the password interactively. Pretend
+                            # to be a TTY to suppress those shenanigans. Further, we
+                            # need to detch since otherwise our terminal is still
+                            # the controlling terminal.
+                            TestHelpers.with_fake_pty() do slave, master
+                                err = Base.Pipe()
+                                p = spawn(detach(
+                                    `$(Base.julia_cmd()) -e $cmd`),slave,slave,slave)
+                                for (challenge, response) in challenges
+                                    @show readuntil(master, challenge)
+                                    sleep(1)
+                                    nb_available(master) != 0 &&
+                                        @show String(readavailable(master))
+                                    @show response
+                                    print(master, response)
+                                end
+                                sleep(2)
+                                nb_available(master) != 0 &&
+                                    @show String(readavailable(master))
+                                @show p
+                                wait(p)
+                                nb_available(master) != 0 &&
+                                    @show String(readavailable(master))
+                            end
+                            run(`ls -la $ssh_repo`)
+                            @test isfile(joinpath(ssh_repo,"testfile"))
+                            rm(ssh_repo, recursive = true)
+                        end
+
+                        # Should use the default files, no interaction required.
+                        try_clone()
+
+                        # Ok, now encrypt the file and test with that (this also
+                        # makes sure that we don't accidentally fall back to the
+                        # unencrypted version)
+                        wait(spawn(`ssh-keygen -p -N "xxxxx" -f $fakehomedir/.ssh/id_rsa`))
+
+                        # Try with the encrypted file. Needs a password.
+                        try_clone(["Passphrase"=>"xxxxx\r\n"])
+
+                        # Move the file. It should now as for the location and
+                        # then the passphrase
+                        mv("$fakehomedir/.ssh/id_rsa","$fakehomedir/.ssh/id_rsa2")
+                        mv("$fakehomedir/.ssh/id_rsa.pub","$fakehomedir/.ssh/id_rsa2.pub")
+                        run(`ls -la $fakehomedir/.ssh`)
+                        try_clone(["location"=>"$fakehomedir/.ssh/id_rsa2\n",
+                                   "Passphrase"=>"xxxxx\n\n"])
+                        mv("$fakehomedir/.ssh/id_rsa2","$fakehomedir/.ssh/id_rsa")
+                        mv("$fakehomedir/.ssh/id_rsa2.pub","$fakehomedir/.ssh/id_rsa.pub")
+
+                        # Ok, now start an agent
+                        agent_sock = tempname()
+                        agentp = spawn(`ssh-agent -a $agent_sock -d`)
+                        while stat(agent_sock).mode == 0 # Wait until the agent is started
+                            sleep(1)
+                        end
+
+                        # fake pty is required for the same reason as in try_clone
+                        # above
+                        TestHelpers.with_fake_pty() do slave, master
+                            ENV["SSH_AUTH_SOCK"] = agent_sock
+                            addp = spawn(
+                                setenv(detach(`ssh-add $fakehomedir/.ssh/id_rsa`),
+                                    Dict("SSH_AUTH_SOCK"=>agent_sock)),
+                                    slave, slave, slave)
+                            write(master, "xxxxx\n")
+                            wait(addp)
+                        end
+
+                        # Should now use the agent
+                        try_clone()
+                    finally
+                        p != nothing && kill(p)
+                        agentp != nothing && kill(agentp)
+                    end
+                end
+            end
+        end
     #end
 end
 

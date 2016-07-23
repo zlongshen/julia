@@ -123,8 +123,10 @@ function credentials_callback(cred::Ptr{Ptr{Void}}, url_ptr::Cstring,
                 else
                     keydefpath =
                         prompt("Private key location for '$schema$username@$host'", default=keydefpath)
+                    @show keydefpath
                 end
             end
+            keydefpath
         end
         # If the private key changed, invalidate the cached public key
         (privatekey != creds[:prvkey, credid]) &&
@@ -153,7 +155,7 @@ function credentials_callback(cred::Ptr{Ptr{Void}}, url_ptr::Cstring,
 
         passphrase_required = true
         if !isfile(privatekey)
-            warn("Private key not found")
+            warn("Private key `$privatekey` not found")
         else
             # In encrypted private keys, the second line is "Proc-Type: 4,ENCRYPTED"
             open(privatekey) do f
