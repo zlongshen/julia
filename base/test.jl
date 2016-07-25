@@ -440,9 +440,11 @@ end
 record(ts::DefaultTestSet, t::AbstractTestSet) = push!(ts.results, t)
 
 function print_test_errors(ts::DefaultTestSet)
+    println("Errors in testset $(ts.description):")
     for t in ts.results
         if (isa(t, Error) || isa(t, Fail)) && myid() == 1
             Base.show(STDOUT,t)
+            println()
         elseif isa(t, DefaultTestSet)
             print_test_errors(t)
         end
