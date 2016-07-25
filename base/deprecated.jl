@@ -775,6 +775,11 @@ function transpose(x)
     return x
 end
 
+@deprecate (+)(J::UniformScaling, x::Number) J.λ + x
+@deprecate (+)(x::Number, J::UniformScaling) x + J.λ
+@deprecate (-)(J::UniformScaling, x::Number) J.λ - x
+@deprecate (-)(x::Number, J::UniformScaling) x - J.λ
+
 # During the 0.5 development cycle, do not add any deprecations below this line
 # To be deprecated in 0.6
 
