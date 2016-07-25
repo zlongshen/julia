@@ -95,6 +95,25 @@ function unlock(rl::ReentrantLock)
     return
 end
 
+function lock(f, l)
+    lock(l)
+    try
+        return f()
+    finally
+        unlock(l)
+    end
+end
+
+function trylock(f, l)
+    if trylock(l)
+        try
+            return f()
+        finally
+            unlock(l)
+        end
+    end
+end
+
 """
     Semaphore(sem_size)
 

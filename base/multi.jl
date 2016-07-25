@@ -567,27 +567,38 @@ function deregister_worker(pg, pid)
     # delete this worker from our remote reference client sets
     ids = []
     tonotify = []
-    for (id,rv) in pg.refs
-        if in(pid,rv.clientset)
-            push!(ids, id)
+    lock(client_refs) do
+        for (id,rv) in pg.refs
+            if in(pid,rv.clientset)
+                push!(ids, id)
+            end
+            if rv.waitingfor == pid
+                push!(tonotify, (id,rv))
+            end
         end
-        if rv.waitingfor == pid
-            push!(tonotify, (id,rv))
+        for id in ids
+            del_client(pg, id, pid)
         end
-    end
-    for id in ids
-        del_client(pg, id, pid)
-    end
 
-    # throw exception to tasks waiting for this pid
-    for (id,rv) in tonotify
-        notify_error(rv.c, ProcessExitedException())
-        delete!(pg.refs, id)
+        # throw exception to tasks waiting for this pid
+        for (id,rv) in tonotify
+            notify_error(rv.c, ProcessExitedException())
+            delete!(pg.refs, id)
+        end
     end
 end
 
 ## remote refs ##
-const client_refs = WeakKeyDict()
+
+"""
+    client_refs
+
+Tracks whether a particular AbstractRemoteRef
+(identified by its RRID) exists on this worker.
+
+The client_refs lock is also used to synchronize access to `.refs` and associated clientset state
+"""
+const client_refs = WeakKeyDict{Any, Void}() # used as a WeakKeySet
 
 abstract AbstractRemoteRef
 
@@ -610,34 +621,26 @@ type RemoteChannel{T<:AbstractChannel} <: AbstractRemoteRef
 end
 
 function test_existing_ref(r::AbstractRemoteRef)
-    found = getkey(client_refs, r, false)
-    if found !== false
-        if client_refs[r] == true
-            @assert r.where > 0
-            if isa(r, Future) && isnull(found.v) && !isnull(r.v)
-                # we have recd the value from another source, probably a deserialized ref, send a del_client message
-                send_del_client(r)
-                found.v = r.v
-            end
-            return found
-         else
-            # just delete the entry.
-            delete!(client_refs, found)
-         end
+    found = getkey(client_refs, r, nothing)
+    if found !== nothing
+        @assert r.where > 0
+        if isa(r, Future) && isnull(found.v) && !isnull(r.v)
+            # we have recd the value from another source, probably a deserialized ref, send a del_client message
+            send_del_client(r)
+            found.v = r.v
+        end
+        return found::typeof(r)
     end
 
-    client_refs[r] = true
+    client_refs[r] = nothing
     finalizer(r, finalize_ref)
     return r
 end
 
 function finalize_ref(r::AbstractRemoteRef)
-    if r.where > 0      # Handle the case of the finalizer having being called manually
-        if haskey(client_refs, r)
-            # NOTE: Change below line to deleting the entry once issue https://github.com/JuliaLang/julia/issues/14445
-            # is fixed.
-            client_refs[r] = false
-        end
+    if r.where > 0 # Handle the case of the finalizer having being called manually
+        islocked(client_refs) && return finalizer(r, finalize_ref) # delay finalizer for later when its not already locked
+        delete!(client_refs, r)
         if isa(r, RemoteChannel)
             send_del_client(r)
         else
@@ -647,7 +650,7 @@ function finalize_ref(r::AbstractRemoteRef)
         end
         r.where = 0
     end
-    return r
+    nothing
 end
 
 Future(w::LocalProcess) = Future(w.id)
@@ -668,29 +671,33 @@ hash(r::AbstractRemoteRef, h::UInt) = hash(r.whence, hash(r.id, h))
 
 remoteref_id(r::AbstractRemoteRef) = RRID(r.whence, r.id)
 function channel_from_id(id)
-    rv = get(PGRP.refs, id, false)
+    rv = lock(client_refs) do
+        return get(PGRP.refs, id, false)
+    end
     if rv === false
         throw(ErrorException("Local instance of remote reference not found"))
     end
-    rv.c
+    return rv.c
 end
 
 lookup_ref(rrid::RRID, f=def_rv_channel) = lookup_ref(PGRP, rrid, f)
 function lookup_ref(pg, rrid, f)
-    rv = get(pg.refs, rrid, false)
-    if rv === false
-        # first we've heard of this ref
-        rv = RemoteValue(f())
-        pg.refs[rrid] = rv
-        push!(rv.clientset, rrid.whence)
-    end
-    rv
+    return lock(client_refs) do
+        rv = get(pg.refs, rrid, false)
+        if rv === false
+            # first we've heard of this ref
+            rv = RemoteValue(f())
+            pg.refs[rrid] = rv
+            push!(rv.clientset, rrid.whence)
+        end
+        return rv
+    end::RemoteValue
 end
 function isready(rr::Future)
     !isnull(rr.v) && return true
 
     rid = remoteref_id(rr)
-    if rr.where == myid()
+    return if rr.where == myid()
         isready(lookup_ref(rid).c)
     else
         remotecall_fetch(rid->isready(lookup_ref(rid).c), rr.where, rid)
@@ -699,7 +706,7 @@ end
 
 function isready(rr::RemoteChannel, args...)
     rid = remoteref_id(rr)
-    if rr.where == myid()
+    return if rr.where == myid()
         isready(lookup_ref(rid).c, args...)
     else
         remotecall_fetch(rid->isready(lookup_ref(rid).c, args...), rr.where, rid)
@@ -710,11 +717,7 @@ del_client(rr::AbstractRemoteRef) = del_client(remoteref_id(rr), myid())
 
 del_client(id, client) = del_client(PGRP, id, client)
 function del_client(pg, id, client)
-# As a workaround to issue https://github.com/JuliaLang/julia/issues/14445
-# the dict/set updates are executed asynchronously so that they do
-# not occur in the midst of a gc. The `@async` prefix must be removed once
-# 14445 is fixed.
-    @async begin
+    lock(client_refs) do
         rv = get(pg.refs, id, false)
         if rv !== false
             delete!(rv.clientset, client)
@@ -753,8 +756,10 @@ function send_del_client(rr)
 end
 
 function add_client(id, client)
-    rv = lookup_ref(id)
-    push!(rv.clientset, client)
+    lock(client_refs) do
+        rv = lookup_ref(id)
+        push!(rv.clientset, client)
+    end
     nothing
 end
 
@@ -847,7 +852,7 @@ function run_work_thunk(thunk, print_error)
         result = RemoteException(ce)
         print_error && showerror(STDERR, ce)
     end
-    result
+    return result
 end
 function run_work_thunk(rv::RemoteValue, thunk)
     put!(rv, run_work_thunk(thunk, false))
@@ -855,11 +860,13 @@ function run_work_thunk(rv::RemoteValue, thunk)
 end
 
 function schedule_call(rid, thunk)
-    rv = RemoteValue(def_rv_channel())
-    (PGRP::ProcessGroup).refs[rid] = rv
-    push!(rv.clientset, rid.whence)
-    schedule(@task(run_work_thunk(rv,thunk)))
-    rv
+    return lock(client_refs) do
+        rv = RemoteValue(def_rv_channel())
+        (PGRP::ProcessGroup).refs[rid] = rv
+        push!(rv.clientset, rid.whence)
+        @schedule run_work_thunk(rv, thunk)
+        return rv
+    end
 end
 
 # make a thunk to call f on args in a way that simulates what would happen if
@@ -874,14 +881,14 @@ end
 function remotecall(f, w::LocalProcess, args...; kwargs...)
     rr = Future(w)
     schedule_call(remoteref_id(rr), local_remotecall_thunk(f, args, kwargs))
-    rr
+    return rr
 end
 
 function remotecall(f, w::Worker, args...; kwargs...)
     rr = Future(w)
     #println("$(myid()) asking for $rr")
     send_msg(w, MsgHeader(remoteref_id(rr)), CallMsg{:call}(f, args, kwargs))
-    rr
+    return rr
 end
 
 remotecall(f, id::Integer, args...; kwargs...) = remotecall(f, worker_from_id(id), args...; kwargs...)
@@ -889,7 +896,7 @@ remotecall(f, id::Integer, args...; kwargs...) = remotecall(f, worker_from_id(id
 # faster version of fetch(remotecall(...))
 function remotecall_fetch(f, w::LocalProcess, args...; kwargs...)
     v=run_work_thunk(local_remotecall_thunk(f,args, kwargs), false)
-    isa(v, RemoteException) ? throw(v) : v
+    return isa(v, RemoteException) ? throw(v) : v
 end
 
 function remotecall_fetch(f, w::Worker, args...; kwargs...)
@@ -900,8 +907,10 @@ function remotecall_fetch(f, w::Worker, args...; kwargs...)
     rv.waitingfor = w.id
     send_msg(w, MsgHeader(RRID(0,0), oid), CallMsg{:call_fetch}(f, args, kwargs))
     v = take!(rv)
-    delete!(PGRP.refs, oid)
-    isa(v, RemoteException) ? throw(v) : v
+    lock(client_refs) do
+        delete!(PGRP.refs, oid)
+    end
+    return isa(v, RemoteException) ? throw(v) : v
 end
 
 remotecall_fetch(f, id::Integer, args...; kwargs...) =
@@ -917,9 +926,11 @@ function remotecall_wait(f, w::Worker, args...; kwargs...)
     rr = Future(w)
     send_msg(w, MsgHeader(remoteref_id(rr), prid), CallWaitMsg(f, args, kwargs))
     v = fetch(rv.c)
-    delete!(PGRP.refs, prid)
+    lock(client_refs) do
+        delete!(PGRP.refs, prid)
+    end
     isa(v, RemoteException) && throw(v)
-    rr
+    return rr
 end
 
 remotecall_wait(f, id::Integer, args...; kwargs...) =
@@ -1596,9 +1607,11 @@ function create_worker(manager, wconfig)
 
     @schedule manage(w.manager, w.id, w.config, :register)
     wait(rr_ntfy_join)
-    delete!(PGRP.refs, ntfy_oid)
+    lock(client_refs) do
+        delete!(PGRP.refs, ntfy_oid)
+    end
 
-    w.id
+    return w.id
 end
 
 
@@ -1621,7 +1634,7 @@ function launch_additional(np::Integer, cmd::Cmd)
         additional_io_objs[port] = io
     end
 
-    addresses
+    return addresses
 end
 
 function redirect_output_from_additional_worker(pid, port)
